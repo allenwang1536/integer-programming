@@ -27,6 +27,9 @@ extern "C" {
     fn or_mpsolver_objective_value(ptr: *mut c_void) -> f64;
     fn or_var_solution_value(var: *mut c_void) -> f64;
     fn or_var_set_bounds(ptr: *mut c_void, lb: f64, ub: f64);
+    fn or_mpsolver_save_basis(ptr: *mut c_void) -> *mut c_void;
+    fn or_mpsolver_restore_basis(ptr: *mut c_void, basis: *mut c_void);
+    fn or_delete_basis(basis: *mut c_void);
 }
 
 #[repr(transparent)]
@@ -40,6 +43,8 @@ pub struct OrVarHandle(pub *mut c_void);
 #[repr(transparent)]
 #[derive(Clone)]
 pub struct OrConstraintHandle(pub *mut c_void);
+
+pub struct OrBasisHandle(pub *mut c_void);
 
 impl OrSolverHandle {
     pub fn new_scip() -> Self {
@@ -96,6 +101,13 @@ impl OrSolverHandle {
     pub fn objective_value(&self) -> f64 {
         unsafe { or_mpsolver_objective_value(self.0) }
     }
+    pub fn save_basis(&self) -> OrBasisHandle {
+        let p = unsafe { or_mpsolver_save_basis(self.0) };
+        OrBasisHandle(p)
+    }
+    pub fn restore_basis(&self, basis: &OrBasisHandle) {
+        unsafe { or_mpsolver_restore_basis(self.0, basis.0) }
+    }
 }
 
 impl OrVarHandle {
@@ -114,11 +126,17 @@ impl Drop for OrSolverHandle {
     }
 }
 
+impl Drop for OrBasisHandle {
+    fn drop(&mut self) {
+        unsafe { or_delete_basis(self.0) }
+    }
+}
+
+pub use OrBasisHandle as BasisHandle;
 pub use OrConstraintHandle as ConstraintHandle;
 pub use OrSolverHandle as SolverHandle;
 pub use OrVarHandle as VarHandle;
 
-// Mirror MPSolver::ResultStatus for convenience.
 pub mod status {
     pub const OPTIMAL: i32 = 0;
     pub const FEASIBLE: i32 = 1;

@@ -1,4 +1,10 @@
-use std::f64;
+use std::{
+    cmp::{Ordering, Reverse},
+    collections::BinaryHeap,
+    f64, usize,
+};
+
+use ordered_float::NotNan;
 
 use crate::{
     ffi::{
@@ -8,10 +14,15 @@ use crate::{
     instance::IPInstance,
 };
 
+type NodeId = usize;
+const NO_PARENT: NodeId = usize::MAX;
+
 pub struct BNCSolver {
     lp_solver: OrSolverHandle,
     test_var: Vec<OrVarHandle>,
     constraints: Vec<OrConstraintHandle>,
+    nodes: Vec<Node>,
+    heads: BinaryHeap<SearchHead>,
     pub instance: IPInstance,
 }
 
@@ -20,9 +31,31 @@ struct Fixing {
     val: f64,
 }
 
-enum Node {
-    Solve(Option<Fixing>),
-    Undo(OrVarHandle),
+struct Node {
+    parent: NodeId,
+    fixing: Option<Fixing>,
+    lb: f64,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct SearchHead {
+    node: NodeId,
+    lb: NotNan<f64>,
+}
+
+impl Ord for SearchHead {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .lb
+            .cmp(&self.lb)
+            .then_with(|| self.node.cmp(&other.node))
+    }
+}
+
+impl PartialOrd for SearchHead {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl BNCSolver {
@@ -57,68 +90,101 @@ impl BNCSolver {
             lp_solver,
             test_var,
             constraints,
+            nodes: Vec::new(),
+            heads: BinaryHeap::new(),
             instance,
         }
     }
 
+    fn reset_vars(&mut self) {
+        for v in &self.test_var {
+            v.set_bounds(0.0, 1.0);
+        }
+    }
+
+    fn insert_node(&mut self, node: Node) -> NodeId {
+        let id = self.nodes.len() as NodeId;
+        self.nodes.push(node);
+        id
+    }
+
+    fn apply_fixings(&mut self, node: NodeId) {
+        let mut cur = node;
+        while cur != NO_PARENT {
+            if let Some(Fixing { var, val }) = &self.nodes[cur].fixing {
+                var.set_bounds(*val, *val);
+            }
+            cur = self.nodes[cur].parent;
+        }
+    }
+
     pub fn solve(&mut self) -> usize {
-        let mut stack = vec![Node::Solve(None)];
+        let root_id = self.insert_node(Node {
+            parent: NO_PARENT,
+            fixing: None,
+            lb: 0.0,
+        });
+        self.heads.push(SearchHead {
+            node: root_id,
+            lb: NotNan::new(0.0).unwrap(),
+        });
 
         let mut ip_opt = f64::INFINITY;
         let mut soln = vec![0u8; self.instance.num_tests];
 
-        while let Some(cur) = stack.pop() {
-            match cur {
-                Node::Solve(fixing) => {
-                    // fix
-                    if let Some(Fixing { var, val }) = fixing {
-                        var.set_bounds(val, val);
-                    }
+        while let Some(cur) = self.heads.pop() {
+            self.reset_vars();
+            self.apply_fixings(cur.node);
 
-                    // do solve
-                    match self.lp_solver.solve() {
-                        OPTIMAL => {
-                            // if cur LB is worse than incumb, drop
-                            let cur_obj = self.lp_solver.objective_value();
-                            if cur_obj >= ip_opt {
-                                continue;
-                            }
-                            // find non-integral var
-                            if let Some(var) = self.find_non_integral() {
-                                // branch on this var
-                                stack.push(Node::Undo(var.clone()));
-                                stack.push(Node::Solve(Some(Fixing {
-                                    var: var.clone(),
-                                    val: 1.0,
-                                })));
-                                stack.push(Node::Solve(Some(Fixing { var, val: 0.0 })));
-                            } else {
-                                // this is ip feasible
-                                println!("found some ip feasible with obj: {}", cur_obj);
-                                if cur_obj < ip_opt {
-                                    ip_opt = cur_obj;
-                                    for (t, v) in self.test_var.iter().enumerate() {
-                                        soln[t] = v.solution_value() as u8;
-                                    }
-                                }
+            // do solve
+            match self.lp_solver.solve() {
+                OPTIMAL => {
+                    // if cur LB is worse than incumb, drop
+                    let cur_lb = self.lp_solver.objective_value();
+                    if cur_lb >= ip_opt {
+                        continue;
+                    }
+                    // find non-integral var
+                    if let Some(var) = self.find_non_integral() {
+                        // branch on this var
+                        let l = self.insert_node(Node {
+                            parent: cur.node,
+                            lb: cur_lb,
+                            fixing: Some(Fixing {
+                                var: var.clone(),
+                                val: 0.0,
+                            }),
+                        });
+                        let r = self.insert_node(Node {
+                            parent: cur.node,
+                            lb: cur_lb,
+                            fixing: Some(Fixing { var, val: 1.0 }),
+                        });
+                        self.heads.push(SearchHead {
+                            node: r,
+                            lb: NotNan::new(cur_lb).unwrap(),
+                        });
+                        self.heads.push(SearchHead {
+                            node: l,
+                            lb: NotNan::new(cur_lb).unwrap(),
+                        });
+                    } else {
+                        // this is ip feasible
+                        println!("found some ip feasible with obj: {}", cur_lb);
+                        if cur_lb < ip_opt {
+                            ip_opt = cur_lb;
+                            for (t, v) in self.test_var.iter().enumerate() {
+                                soln[t] = v.solution_value() as u8;
                             }
                         }
-                        INFEASIBLE => {
-                            // nooo
-                        }
-                        _ => unreachable!(),
                     }
                 }
-
-                Node::Undo(var) => {
-                    var.set_bounds(0.0, 1.0);
+                INFEASIBLE => {
+                    // nooo
                 }
+                _ => unreachable!(),
             }
         }
-
-        // for (t, v) in soln.iter().enumerate() {
-        //     println!("use_test[{}] = {}", t, v);
-        // }
 
         ip_opt as usize
     }
