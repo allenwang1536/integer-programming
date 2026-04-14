@@ -1,5 +1,5 @@
 use std::{
-    cmp::{Ordering, Reverse},
+    cmp::Ordering,
     collections::BinaryHeap,
     f64,
     time::{Duration, Instant},
@@ -190,7 +190,7 @@ impl BNCSolver {
             basis: self.lp_solver.save_basis(),
         });
 
-        let mut ip_opt = f64::INFINITY;
+        let mut ip_opt = NotNan::new(f64::INFINITY).unwrap();
         let mut soln = vec![0u8; self.instance.num_tests];
 
         // let mut i = 0;
@@ -206,15 +206,15 @@ impl BNCSolver {
             // i += 1;
 
             // if cur LB is worse than incumb, drop
-            if cur.lb >= NotNan::new(ip_opt).unwrap() {
-                continue;
+            if cur.lb >= ip_opt {
+                break;
             }
 
             match cur.status {
                 NodeStatus::Integral => {
                     // this is ip feasible
-                    if *cur.lb < ip_opt {
-                        ip_opt = *cur.lb;
+                    if cur.lb < ip_opt {
+                        ip_opt = cur.lb;
                         for (t, v) in self.test_var.iter().enumerate() {
                             soln[t] = v.solution_value() as u8;
                         }
@@ -233,7 +233,7 @@ impl BNCSolver {
             }
         }
 
-        ip_opt as usize
+        *ip_opt as usize
     }
 
     pub fn find_non_integral(&self) -> Option<u32> {
