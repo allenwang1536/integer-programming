@@ -7,8 +7,7 @@
 namespace or_tools = operations_research;
 
 struct LpBasis {
-  std::vector<or_tools::MPSolver::BasisStatus> var_status;
-  std::vector<or_tools::MPSolver::BasisStatus> ct_status;
+  std::vector<double> var_values;
 };
 
 extern "C" {
@@ -79,14 +78,9 @@ extern "C" OrBasisPtr or_mpsolver_save_basis(OrSolverPtr p) {
   auto* solver = reinterpret_cast<or_tools::MPSolver*>(p);
   auto* basis = new LpBasis();
   const auto& vars = solver->variables();
-  const auto& cts = solver->constraints();
-  basis->var_status.resize(vars.size());
-  basis->ct_status.resize(cts.size());
+  basis->var_values.resize(vars.size());
   for (size_t i = 0; i < vars.size(); ++i) {
-    basis->var_status[i] = vars[i]->basis_status();
-  }
-  for (size_t i = 0; i < cts.size(); ++i) {
-    basis->ct_status[i] = cts[i]->basis_status();
+    basis->var_values[i] = vars[i]->solution_value();
   }
   return reinterpret_cast<OrBasisPtr>(basis);
 }
@@ -94,7 +88,13 @@ extern "C" OrBasisPtr or_mpsolver_save_basis(OrSolverPtr p) {
 extern "C" void or_mpsolver_restore_basis(OrSolverPtr p, OrBasisPtr b) {
   auto* solver = reinterpret_cast<or_tools::MPSolver*>(p);
   auto* basis = reinterpret_cast<LpBasis*>(b);
-  solver->SetStartingLpBasis(basis->var_status, basis->ct_status);
+  const auto& vars = solver->variables();
+  std::vector<std::pair<const or_tools::MPVariable*, double>> hint;
+  hint.reserve(vars.size());
+  for (size_t i = 0; i < vars.size(); ++i) {
+    hint.emplace_back(vars[i], basis->var_values[i]);
+  }
+  solver->SetHint(std::move(hint));
 }
 
 extern "C" void or_delete_basis(OrBasisPtr b) {

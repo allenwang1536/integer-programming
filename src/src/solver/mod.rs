@@ -1,7 +1,9 @@
 use std::{
     cmp::{Ordering, Reverse},
     collections::BinaryHeap,
-    f64, usize,
+    f64,
+    time::{Duration, Instant},
+    usize,
 };
 
 use ordered_float::NotNan;
@@ -9,7 +11,7 @@ use ordered_float::NotNan;
 use crate::{
     ffi::{
         status::{INFEASIBLE, OPTIMAL},
-        OrConstraintHandle, OrSolverHandle, OrVarHandle,
+        OrBasisHandle, OrConstraintHandle, OrSolverHandle, OrVarHandle,
     },
     instance::IPInstance,
 };
@@ -24,23 +26,31 @@ pub struct BNCSolver {
     nodes: Vec<Node>,
     heads: BinaryHeap<SearchHead>,
     pub instance: IPInstance,
+    pub time: Duration,
 }
 
 struct Fixing {
-    var: OrVarHandle,
-    val: f64,
+    var: u32,
+    val: u8,
 }
 
 struct Node {
     parent: NodeId,
     fixing: Option<Fixing>,
-    lb: f64,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
+enum NodeStatus {
+    Integral,
+    Fractional { branch_var: u32 },
+}
+
+#[derive(Clone, Eq, PartialEq)]
 struct SearchHead {
     node: NodeId,
     lb: NotNan<f64>,
+    status: NodeStatus,
+    basis: OrBasisHandle,
 }
 
 impl Ord for SearchHead {
@@ -93,28 +103,72 @@ impl BNCSolver {
             nodes: Vec::new(),
             heads: BinaryHeap::new(),
             instance,
+            time: Duration::new(0, 0),
         }
     }
 
     fn reset_vars(&mut self) {
+        let t = Instant::now();
         for v in &self.test_var {
             v.set_bounds(0.0, 1.0);
         }
+        self.time += t.elapsed();
     }
 
     fn insert_node(&mut self, node: Node) -> NodeId {
-        let id = self.nodes.len() as NodeId;
+        let id = self.nodes.len();
         self.nodes.push(node);
+        id
+    }
+
+    fn insert_child(&mut self, parent: NodeId, var: u32, val: u8) -> NodeId {
+        let id = self.nodes.len();
+
+        self.nodes.push(Node {
+            parent,
+            fixing: Some(Fixing { var, val }),
+        });
+
         id
     }
 
     fn apply_fixings(&mut self, node: NodeId) {
         let mut cur = node;
         while cur != NO_PARENT {
-            if let Some(Fixing { var, val }) = &self.nodes[cur].fixing {
-                var.set_bounds(*val, *val);
+            if let Some(Fixing { var, val }) = self.nodes[cur].fixing {
+                self.test_var[var as usize].set_bounds(val as f64, val as f64);
             }
             cur = self.nodes[cur].parent;
+        }
+    }
+
+    fn solve_node(&mut self, node: NodeId, basis: Option<&OrBasisHandle>) -> Option<SearchHead> {
+        self.reset_vars();
+        self.apply_fixings(node);
+
+        if let Some(basis) = basis {
+            self.lp_solver.restore_basis(basis);
+        }
+
+        match self.lp_solver.solve() {
+            INFEASIBLE => None,
+            OPTIMAL => {
+                let lb = NotNan::new(self.lp_solver.objective_value()).unwrap();
+
+                // find non-integral var
+                let status = match self.find_non_integral() {
+                    Some(var) => NodeStatus::Fractional { branch_var: var },
+                    None => NodeStatus::Integral,
+                };
+
+                Some(SearchHead {
+                    node,
+                    lb,
+                    status,
+                    basis: self.lp_solver.save_basis(),
+                })
+            }
+            _ => unreachable!(),
         }
     }
 
@@ -122,81 +176,87 @@ impl BNCSolver {
         let root_id = self.insert_node(Node {
             parent: NO_PARENT,
             fixing: None,
-            lb: 0.0,
         });
+
+        self.lp_solver.solve(); // assuming there exists a solution here, wtv
+        let Some(branch_var) = self.find_non_integral() else {
+            return self.lp_solver.objective_value() as usize;
+        };
+
         self.heads.push(SearchHead {
             node: root_id,
-            lb: NotNan::new(0.0).unwrap(),
+            lb: NotNan::new(self.lp_solver.objective_value()).unwrap(),
+            status: NodeStatus::Fractional { branch_var },
+            basis: self.lp_solver.save_basis(),
         });
 
         let mut ip_opt = f64::INFINITY;
         let mut soln = vec![0u8; self.instance.num_tests];
 
-        while let Some(cur) = self.heads.pop() {
-            self.reset_vars();
-            self.apply_fixings(cur.node);
+        // let mut i = 0;
 
-            // do solve
-            match self.lp_solver.solve() {
-                OPTIMAL => {
-                    // if cur LB is worse than incumb, drop
-                    let cur_lb = self.lp_solver.objective_value();
-                    if cur_lb >= ip_opt {
-                        continue;
-                    }
-                    // find non-integral var
-                    if let Some(var) = self.find_non_integral() {
-                        // branch on this var
-                        let l = self.insert_node(Node {
-                            parent: cur.node,
-                            lb: cur_lb,
-                            fixing: Some(Fixing {
-                                var: var.clone(),
-                                val: 0.0,
-                            }),
-                        });
-                        let r = self.insert_node(Node {
-                            parent: cur.node,
-                            lb: cur_lb,
-                            fixing: Some(Fixing { var, val: 1.0 }),
-                        });
-                        self.heads.push(SearchHead {
-                            node: r,
-                            lb: NotNan::new(cur_lb).unwrap(),
-                        });
-                        self.heads.push(SearchHead {
-                            node: l,
-                            lb: NotNan::new(cur_lb).unwrap(),
-                        });
-                    } else {
-                        // this is ip feasible
-                        println!("found some ip feasible with obj: {}", cur_lb);
-                        if cur_lb < ip_opt {
-                            ip_opt = cur_lb;
-                            for (t, v) in self.test_var.iter().enumerate() {
-                                soln[t] = v.solution_value() as u8;
-                            }
+        while let Some(cur) = self.heads.pop() {
+            // if i % 10 == 0 {
+            //     println!(
+            //         "num nodes: {}, num_heads: {}",
+            //         self.nodes.len(),
+            //         self.heads.len()
+            //     )
+            // }
+            // i += 1;
+
+            // if cur LB is worse than incumb, drop
+            if cur.lb >= NotNan::new(ip_opt).unwrap() {
+                continue;
+            }
+
+            match cur.status {
+                NodeStatus::Integral => {
+                    // this is ip feasible
+                    if *cur.lb < ip_opt {
+                        ip_opt = *cur.lb;
+                        for (t, v) in self.test_var.iter().enumerate() {
+                            soln[t] = v.solution_value() as u8;
                         }
                     }
                 }
-                INFEASIBLE => {
-                    // nooo
+                NodeStatus::Fractional { branch_var } => {
+                    let l = self.insert_child(cur.node, branch_var, 0);
+                    let r = self.insert_child(cur.node, branch_var, 1);
+                    if let Some(l_head) = self.solve_node(l, Some(&cur.basis)) {
+                        self.heads.push(l_head);
+                    }
+                    if let Some(r_head) = self.solve_node(r, Some(&cur.basis)) {
+                        self.heads.push(r_head);
+                    }
                 }
-                _ => unreachable!(),
             }
         }
 
         ip_opt as usize
     }
 
-    pub fn find_non_integral(&self) -> Option<OrVarHandle> {
-        for t in &self.test_var {
-            match t.solution_value() {
+    pub fn find_non_integral(&self) -> Option<u32> {
+        let mut most_frac = None;
+        for t in 0..self.instance.num_tests {
+            match self.test_var[t].solution_value() {
                 0.0 | 1.0 => continue,
-                _ => return Some(t.clone()),
+                n => {
+                    let cur_dist = (n - 0.5).abs();
+                    match most_frac {
+                        Some((_, dist)) => {
+                            if cur_dist < dist {
+                                most_frac = Some((t as u32, cur_dist))
+                            }
+                        }
+
+                        None => most_frac = Some((t as u32, (n - 0.5).abs())),
+                    }
+                }
             };
         }
-        None
+
+        most_frac.map(|v| v.0)
     }
 
     pub fn print_soln(&self) {

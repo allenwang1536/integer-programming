@@ -44,6 +44,8 @@ pub struct OrVarHandle(pub *mut c_void);
 #[derive(Clone)]
 pub struct OrConstraintHandle(pub *mut c_void);
 
+#[repr(transparent)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct OrBasisHandle(pub *mut c_void);
 
 impl OrSolverHandle {
