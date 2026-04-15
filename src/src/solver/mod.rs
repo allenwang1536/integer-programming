@@ -6,7 +6,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrd},
         Condvar, Mutex, RwLock,
     },
-    thread, usize,
+    thread,
 };
 
 use ordered_float::NotNan;
@@ -216,8 +216,10 @@ fn worker_loop(shared: &SharedState, worker: &WorkerSolver, num_tests: usize) {
             }
             NodeStatus::Fractional { branch_var } => {
                 // collect parent fixings
-                let nodes = shared.nodes.read().unwrap();
-                let parent_fixings = collect_fixings(&nodes, head.node);
+                let parent_fixings = {
+                    let nodes = shared.nodes.read().unwrap();
+                    collect_fixings(&nodes, head.node)
+                };
 
                 // insert child nodes
                 let (l_id, r_id) = {
