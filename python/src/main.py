@@ -24,7 +24,7 @@ if __name__ == "__main__":
 
     output_dict = {"Instance": filename,
                    "Time": f"{timer.getTime():.2f}",
-                   "Result": objective_value if objective_value else "--",
+                   "Result": objective_value if objective_value is not None else "--",
                    "Solution": "OPT" if solution else "--"}
 
     print(json.dumps(output_dict))

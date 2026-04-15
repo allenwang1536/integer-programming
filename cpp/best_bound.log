@@ -1,0 +1,14 @@
+{"Instance":"100_100_0.25_1.ip","Time":"40.95","Result":153,"Solution":"OPT"}
+{"Instance":"100_100_0.25_3.ip","Time":"5.61","Result":96,"Solution":"OPT"}
+{"Instance":"100_100_0.5_3.ip","Time":"12.68","Result":71,"Solution":"OPT"}
+{"Instance":"100_100_0.5_9.ip","Time":"5.76","Result":74,"Solution":"OPT"}
+{"Instance":"100_200_0.5_5.ip","Time":"43.31","Result":86,"Solution":"OPT"}
+{"Instance":"100_200_0.5_6.ip","Time":"4.69","Result":69,"Solution":"OPT"}
+{"Instance":"100_50_0.5_2.ip","Time":"1.62","Result":72,"Solution":"OPT"}
+{"Instance":"25_25_0.25_1.ip","Time":"0.01","Result":57,"Solution":"OPT"}
+{"Instance":"25_25_0.5_1.ip","Time":"0.01","Result":30,"Solution":"OPT"}
+{"Instance":"25_50_0.5_8.ip","Time":"0.45","Result":77,"Solution":"OPT"}
+{"Instance":"50_100_0.5_4.ip","Time":"8.71","Result":103,"Solution":"OPT"}
+{"Instance":"50_100_0.5_7.ip","Time":"10.55","Result":92,"Solution":"OPT"}
+{"Instance":"50_25_0.5_1.ip","Time":"0.04","Result":37,"Solution":"OPT"}
+{"Instance":"50_50_0.5_5.ip","Time":"0.18","Result":53,"Solution":"OPT"}

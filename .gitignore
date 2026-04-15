@@ -1,0 +1,9 @@
+Project4_Healthcare_Handout.pdf
+.DS_Store
+.vscode/
+cpp/build/
+*.o
+*.d
+__pycache__/
+*.pyc
+*.tmp
