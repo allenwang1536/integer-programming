@@ -441,7 +441,7 @@ impl BNCSolver {
 
     pub fn solve(&mut self) -> usize {
         let num_tests = self.instance.num_tests;
-        let num_threads = 4;
+        let num_threads = 8;
 
         let root_worker = WorkerSolver::new(&self.instance, &[]);
         let (root_cuts, root_cut_stats) = root_worker.run_root_cuts(&self.instance);

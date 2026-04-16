@@ -3,7 +3,11 @@ use std::{env, path::PathBuf};
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
-    let default_ortools = manifest_dir.join(".vendor/or-tools/9.15.6755");
+    let project_root = manifest_dir
+        .parent()
+        .expect("CARGO_MANIFEST_DIR has no parent")
+        .to_path_buf();
+    let default_ortools = project_root.join(".vendor/or-tools/9.15.6755");
     let ortools_root = env::var("ORTOOLS_ROOT")
         .map(PathBuf::from)
         .unwrap_or(default_ortools);
@@ -32,3 +36,4 @@ fn main() {
         ortools_lib_dir.display()
     );
 }
+
