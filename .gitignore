@@ -1,2 +1,7 @@
 .vendor/
 __pycache__/
+.DS_Store
+.vscode/
+Project4_Healthcare_Handout.pdf
+cpp/
+python/

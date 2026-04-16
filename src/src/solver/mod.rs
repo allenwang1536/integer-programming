@@ -1,6 +1,7 @@
 use std::{
     cmp::Ordering,
-    collections::BinaryHeap,
+    collections::{BinaryHeap, HashSet},
+    env,
     f64,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrd},
@@ -28,6 +29,12 @@ const NO_PARENT: NodeId = usize::MAX;
 
 pub struct BNCSolver {
     pub instance: IPInstance,
+}
+
+#[derive(Clone)]
+struct CutRow {
+    vars: Vec<u32>,
+    lb: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -76,6 +83,7 @@ struct SharedState {
     heads_cv: Condvar,
     ip_opt: Mutex<NotNan<f64>>,
     active: AtomicUsize,
+    explored: AtomicUsize,
     done: AtomicBool,
 }
 
@@ -84,8 +92,16 @@ struct WorkerSolver {
     test_var: Vec<OrVarHandle>,
 }
 
+#[derive(Default)]
+struct RootCutStats {
+    initial_lb: Option<f64>,
+    final_lb: f64,
+    cuts_added: usize,
+    lp_solves: usize,
+}
+
 impl WorkerSolver {
-    fn new(instance: &IPInstance) -> Self {
+    fn new(instance: &IPInstance, cuts: &[CutRow]) -> Self {
         let lp_solver = OrSolverHandle::new_scip();
         let mut test_var = Vec::with_capacity(instance.num_tests);
 
@@ -109,10 +125,88 @@ impl WorkerSolver {
         }
         lp_solver.objective_set_minimize();
 
-        WorkerSolver {
+        let worker = WorkerSolver {
             lp_solver,
             test_var,
+        };
+        for cut in cuts {
+            worker.add_cut(cut);
         }
+
+        worker
+    }
+
+    fn add_cut(&self, cut: &CutRow) {
+        let c = self.lp_solver.make_constraint(cut.lb, f64::INFINITY);
+        for &var in &cut.vars {
+            self.lp_solver
+                .constraint_set_coefficient(&c, &self.test_var[var as usize], 1.0);
+        }
+    }
+
+    fn solution_values(&self, num_tests: usize) -> Vec<f64> {
+        let mut values = Vec::with_capacity(num_tests);
+        for t in 0..num_tests {
+            values.push(self.test_var[t].solution_value());
+        }
+        values
+    }
+
+    fn run_root_cuts(&self, instance: &IPInstance) -> (Vec<CutRow>, RootCutStats) {
+        const MAX_CUT_PASSES: usize = 3;
+        const MAX_TRIPLET_CUTS_PER_PASS: usize = 64;
+
+        let mut cuts = Vec::new();
+        let mut stats = RootCutStats::default();
+        let mut seen = HashSet::<Vec<u32>>::new();
+
+        for _ in 0..MAX_CUT_PASSES {
+            match self.lp_solver.solve() {
+                INFEASIBLE => {
+                    stats.final_lb = f64::INFINITY;
+                    return (cuts, stats);
+                }
+                OPTIMAL => {}
+                _ => unreachable!(),
+            }
+
+            stats.lp_solves += 1;
+            let lb = self.lp_solver.objective_value();
+            stats.initial_lb.get_or_insert(lb);
+
+            let solution = self.solution_values(instance.num_tests);
+            let mut new_cuts = Vec::new();
+
+            if let Some(cut) = separate_global_counting_cut(instance, &solution) {
+                push_new_cut(&mut new_cuts, &mut seen, cut);
+            }
+
+            for cut in separate_triplet_cuts(instance, &solution, MAX_TRIPLET_CUTS_PER_PASS) {
+                push_new_cut(&mut new_cuts, &mut seen, cut);
+            }
+
+            if new_cuts.is_empty() {
+                stats.final_lb = lb;
+                return (cuts, stats);
+            }
+
+            for cut in &new_cuts {
+                self.add_cut(cut);
+            }
+            stats.cuts_added += new_cuts.len();
+            cuts.extend(new_cuts);
+        }
+
+        match self.lp_solver.solve() {
+            INFEASIBLE => stats.final_lb = f64::INFINITY,
+            OPTIMAL => {
+                stats.lp_solves += 1;
+                stats.final_lb = self.lp_solver.objective_value();
+            }
+            _ => unreachable!(),
+        }
+
+        (cuts, stats)
     }
 
     fn reset_and_apply(&self, fixings: &[(u32, u8)]) {
@@ -166,6 +260,74 @@ impl WorkerSolver {
     }
 }
 
+fn stats_enabled() -> bool {
+    env::var("IP_STATS").ok().as_deref() == Some("1")
+}
+
+fn counting_rhs(size: usize) -> f64 {
+    size.next_power_of_two().trailing_zeros() as f64
+}
+
+fn push_new_cut(new_cuts: &mut Vec<CutRow>, seen: &mut HashSet<Vec<u32>>, cut: CutRow) {
+    if seen.insert(cut.vars.clone()) {
+        new_cuts.push(cut);
+    }
+}
+
+fn separate_global_counting_cut(instance: &IPInstance, solution: &[f64]) -> Option<CutRow> {
+    let mut vars = Vec::new();
+    let mut lhs = 0.0;
+
+    for t in 0..instance.num_tests {
+        let first = instance.at(t, 0);
+        let splits_all = (1..instance.num_diseases).any(|d| instance.at(t, d) != first);
+        if splits_all {
+            vars.push(t as u32);
+            lhs += solution[t];
+        }
+    }
+
+    let rhs = counting_rhs(instance.num_diseases);
+    (lhs + 1e-9 < rhs).then_some(CutRow { vars, lb: rhs })
+}
+
+fn separate_triplet_cuts(
+    instance: &IPInstance,
+    solution: &[f64],
+    max_cuts: usize,
+) -> Vec<CutRow> {
+    let mut violated = Vec::<(f64, Vec<u32>)>::new();
+
+    for a in 0..instance.num_diseases {
+        for b in a + 1..instance.num_diseases {
+            for c in b + 1..instance.num_diseases {
+                let mut vars = Vec::new();
+                let mut lhs = 0.0;
+                for t in 0..instance.num_tests {
+                    let v0 = instance.at(t, a);
+                    if instance.at(t, b) != v0 || instance.at(t, c) != v0 {
+                        vars.push(t as u32);
+                        lhs += solution[t];
+                    }
+                }
+
+                if lhs + 1e-9 >= 2.0 || vars.is_empty() {
+                    continue;
+                }
+
+                violated.push((lhs, vars));
+            }
+        }
+    }
+
+    violated.sort_by(|(lhs_a, _), (lhs_b, _)| lhs_a.total_cmp(lhs_b));
+    violated
+        .into_iter()
+        .take(max_cuts)
+        .map(|(_, vars)| CutRow { vars, lb: 2.0 })
+        .collect()
+}
+
 fn collect_fixings(nodes: &[Node], mut node: NodeId) -> Vec<(u32, u8)> {
     let mut fixings = Vec::new();
     while node != NO_PARENT {
@@ -187,6 +349,7 @@ fn worker_loop(shared: &SharedState, worker: &WorkerSolver, num_tests: usize) {
                 }
                 if let Some(h) = heads.pop() {
                     shared.active.fetch_add(1, AtomicOrd::SeqCst);
+                    shared.explored.fetch_add(1, AtomicOrd::SeqCst);
                     break h;
                 }
                 // heap empty... are we done?
@@ -280,10 +443,19 @@ impl BNCSolver {
         let num_tests = self.instance.num_tests;
         let num_threads = 4;
 
-        let root_worker = WorkerSolver::new(&self.instance);
-        root_worker.lp_solver.solve();
+        let root_worker = WorkerSolver::new(&self.instance, &[]);
+        let (root_cuts, root_cut_stats) = root_worker.run_root_cuts(&self.instance);
 
         let Some(branch_var) = root_worker.find_non_integral(num_tests) else {
+            if stats_enabled() {
+                eprintln!(
+                    "cuts=global+triplets root_lb_before={:.6} root_lb_after={:.6} root_cuts={} root_lp_solves={} nodes=0",
+                    root_cut_stats.initial_lb.unwrap_or(0.0),
+                    root_cut_stats.final_lb,
+                    root_cut_stats.cuts_added,
+                    root_cut_stats.lp_solves
+                );
+            }
             return root_worker.lp_solver.objective_value() as usize;
         };
 
@@ -300,6 +472,7 @@ impl BNCSolver {
             heads_cv: Condvar::new(),
             ip_opt: Mutex::new(NotNan::new(f64::INFINITY).unwrap()),
             active: AtomicUsize::new(0),
+            explored: AtomicUsize::new(0),
             done: AtomicBool::new(false),
         };
 
@@ -314,13 +487,23 @@ impl BNCSolver {
         thread::scope(|s| {
             for _ in 0..num_threads {
                 s.spawn(|| {
-                    let worker = WorkerSolver::new(instance);
+                    let worker = WorkerSolver::new(instance, &root_cuts);
                     worker_loop(&shared, &worker, num_tests);
                 });
             }
         });
 
         let ip_opt = *shared.ip_opt.lock().unwrap();
+        if stats_enabled() {
+            eprintln!(
+                "cuts=global+triplets root_lb_before={:.6} root_lb_after={:.6} root_cuts={} root_lp_solves={} nodes={}",
+                root_cut_stats.initial_lb.unwrap_or(0.0),
+                root_cut_stats.final_lb,
+                root_cut_stats.cuts_added,
+                root_cut_stats.lp_solves,
+                shared.explored.load(AtomicOrd::SeqCst)
+            );
+        }
         *ip_opt as usize
     }
 }
