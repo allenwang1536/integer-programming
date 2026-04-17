@@ -1,14 +1,65 @@
 use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashSet},
-    env,
-    f64,
+    env, f64,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrd},
         Condvar, Mutex, RwLock,
     },
     thread,
 };
+
+struct FixingState {
+    fixed: Vec<u64>,
+    values: Vec<u64>,
+}
+
+impl FixingState {
+    fn new(num_vars: usize) -> Self {
+        let words = (num_vars + 63) / 64;
+        FixingState {
+            fixed: vec![0u64; words],
+            values: vec![0u64; words],
+        }
+    }
+
+    fn apply_transition(&mut self, new_fixings: &[(u32, u8)], worker: &WorkerSolver) {
+        let mut new_fixed = vec![0u64; self.fixed.len()];
+        let mut new_values = vec![0u64; self.fixed.len()];
+
+        for &(var, val) in new_fixings {
+            let w = var as usize / 64;
+            let b = var as u64 % 64;
+            new_fixed[w] |= 1 << b;
+            if val == 1 {
+                new_values[w] |= 1 << b;
+            }
+        }
+
+        for w in 0..self.fixed.len() {
+            let fix_changed = self.fixed[w] ^ new_fixed[w];
+            let val_changed = self.values[w] ^ new_values[w];
+            let changed = fix_changed | (new_fixed[w] & val_changed);
+
+            let mut bits = changed;
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                let var = w * 64 + bit;
+                let is_fixed = (new_fixed[w] >> bit) & 1;
+                if is_fixed == 0 {
+                    worker.test_var[var].set_bounds(0.0, 1.0);
+                } else {
+                    let val = ((new_values[w] >> bit) & 1) as f64;
+                    worker.test_var[var].set_bounds(val, val);
+                }
+                bits &= bits - 1;
+            }
+        }
+
+        self.fixed = new_fixed;
+        self.values = new_values;
+    }
+}
 
 use ordered_float::NotNan;
 
@@ -209,15 +260,6 @@ impl WorkerSolver {
         (cuts, stats)
     }
 
-    fn reset_and_apply(&self, fixings: &[(u32, u8)]) {
-        for v in &self.test_var {
-            v.set_bounds(0.0, 1.0);
-        }
-        for &(var, val) in fixings {
-            self.test_var[var as usize].set_bounds(val as f64, val as f64);
-        }
-    }
-
     fn find_non_integral(&self, num_tests: usize) -> Option<u32> {
         let mut most_frac = None;
         for t in 0..num_tests {
@@ -291,11 +333,7 @@ fn separate_global_counting_cut(instance: &IPInstance, solution: &[f64]) -> Opti
     (lhs + 1e-9 < rhs).then_some(CutRow { vars, lb: rhs })
 }
 
-fn separate_triplet_cuts(
-    instance: &IPInstance,
-    solution: &[f64],
-    max_cuts: usize,
-) -> Vec<CutRow> {
+fn separate_triplet_cuts(instance: &IPInstance, solution: &[f64], max_cuts: usize) -> Vec<CutRow> {
     let mut violated = Vec::<(f64, Vec<u32>)>::new();
 
     for a in 0..instance.num_diseases {
@@ -340,6 +378,7 @@ fn collect_fixings(nodes: &[Node], mut node: NodeId) -> Vec<(u32, u8)> {
 }
 
 fn worker_loop(shared: &SharedState, worker: &WorkerSolver, num_tests: usize) {
+    let mut fixing_state = FixingState::new(num_tests);
     loop {
         let head = {
             let mut heads = shared.heads.lock().unwrap();
@@ -409,7 +448,7 @@ fn worker_loop(shared: &SharedState, worker: &WorkerSolver, num_tests: usize) {
                 // solve left
                 let mut fixings = parent_fixings.clone();
                 fixings.push((branch_var, 0));
-                worker.reset_and_apply(&fixings);
+                fixing_state.apply_transition(&fixings, worker);
                 worker.lp_solver.restore_basis(&head.basis);
                 if let Some(l_head) = worker.solve_lp(l_id, num_tests) {
                     let mut heads = shared.heads.lock().unwrap();
@@ -419,7 +458,7 @@ fn worker_loop(shared: &SharedState, worker: &WorkerSolver, num_tests: usize) {
 
                 // solve right
                 *fixings.last_mut().unwrap() = (branch_var, 1);
-                worker.reset_and_apply(&fixings);
+                fixing_state.apply_transition(&fixings, worker);
                 worker.lp_solver.restore_basis(&head.basis);
                 if let Some(r_head) = worker.solve_lp(r_id, num_tests) {
                     let mut heads = shared.heads.lock().unwrap();
