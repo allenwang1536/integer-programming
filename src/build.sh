@@ -85,5 +85,3 @@ if [[ ! -d "$VENDOR_DIR/include" ]]; then
 fi
 
 echo "OR-Tools installed at: $VENDOR_DIR"
-
-cd src && cargo build --release  && cd ..
